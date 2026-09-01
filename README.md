@@ -2,7 +2,8 @@
 
 **Verificate Gate is an AI-powered CI gate for GitHub.** It protects your repository from AI hallucination — code that looks right but isn't real — and performs automated checks for **security, reliability, performance efficiency and maintainability (ISO 5055)** on every pull request. If a change has a real problem, the pull request is blocked until it's fixed.
 
-[![Verificate Gate](https://img.shields.io/badge/gated%20by-Verificate-2ea44f?logo=shield)](https://github.com/VerificateAI/verificate-gate-action)
+[![GitHub Marketplace](https://img.shields.io/badge/GitHub%20Marketplace-Verificate%20Gate-2ea44f?logo=github)](https://github.com/marketplace/actions/verificate-gate)
+[![gated by Verificate](https://img.shields.io/badge/gated%20by-Verificate-2ea44f?logo=shield)](https://github.com/VerificateAI/verificate-gate-action)
 [![Benchmark](https://img.shields.io/badge/AI%20self--review%200%2F6%20%E2%86%92%20Gate%206%2F6-2ea44f)](https://github.com/VerificateAI/verificate-mcp-quickstart/blob/master/COMPARISON.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-2ea44f.svg)](LICENSE)
 
@@ -63,6 +64,8 @@ Every pull request gets a clear verdict, in plain English, right on the PR:
 - **It catches what AI review misses.** In our published benchmark, a leading AI model asked to review its own code caught **0 of 6** planted problems (a fake API and a self-passing test). Verificate Gate caught **6 of 6**, every run. [See the benchmark →](https://github.com/VerificateAI/verificate-mcp-quickstart/blob/master/COMPARISON.md)
 - **Low noise, not just high recall.** The gate reasons about *reachability*: a `subprocess`/`exec`/`import` call fed by a CLI argument, a local config value, or a trusted literal is the intended behaviour of a dev tool or build script — not command injection — so it is not flagged. You get the real defects without a wall of false alarms that trains people to ignore the check.
 
+Built for teams using **GitHub Copilot, Claude Code, Cursor, Windsurf, Cline, Aider, Codex** or any AI coding assistant — the gate catches what the assistant got wrong *before* the PR lands. It works on every pull request, including AI-generated ones, and pairs with the [Verificate MCP server](https://github.com/VerificateAI/verificate-mcp-quickstart) for in-editor gating as code is written.
+
 ## The problem: AI writes the code, humans carry the review
 
 AI tools now write more and more of the code that lands in pull requests — far more than human reviewers can carefully read. AI-written code is fluent and confident even when it is wrong, so the worst mistakes are the hardest to spot: a function that doesn't exist, a test that can't fail, a stub that looks finished.
@@ -99,6 +102,33 @@ All settings are optional.
           verificate-api-key: ${{ secrets.VERIFICATE_API_KEY }}
           fail-on: reject
 ```
+
+## Outputs
+
+The step exposes outputs you can use in later steps — auto-label a rejected PR, notify, or build dashboards:
+
+| Output | Value |
+|---|---|
+| `verdict` | `approved` / `rejected` / `vetoed` / `error` (transient gate failures never block merges) |
+| `files_reviewed` | Changed code files reviewed |
+| `files_errored` | Files skipped (transient error or quota) |
+| `files_dropped` | Files beyond `max-files` that were left unreviewed |
+
+```yaml
+      - uses: VerificateAI/verificate-gate-action@v1
+        id: gate
+      - if: steps.gate.outputs.verdict == 'vetoed'
+        run: echo "A deterministic reality gate vetoed this change."
+```
+
+## FAQ
+
+- **Do PRs from forks get reviewed?** Yes — the free tier uses GitHub's signed OIDC token, not a repository secret, so fork PRs work with `id-token: write`. (GitHub never hands secrets to fork-originated PRs; OIDC is unaffected.)
+- **What if the shared free tier is used up on a busy runner?** The gate fails open with a note on the PR and never blocks the merge. A free key ([verificate.ai/auth/signup](https://verificate.ai/auth/signup), no card) gives the repo its own quota as `VERIFICATE_API_KEY`.
+- **What if Verificate is down or the network blips?** The gate retries transient failures and then fails open: an outage on the Verificate side never blocks your team's merges.
+- **Big PRs?** The gate reviews up to `max-files` (default 25, up to 300) changed code files per PR and notes the remainder on the PR. Raise the cap or review locally for the full detail.
+- **Must code leave our infrastructure?** No — point `mcp-url` at your own Verificate deployment and nothing leaves your environment.
+- **Disagree with a finding?** Add a proof-backed entry to `.verificate/rebuttals.md` — the gate re-adjudicates on the next run and overturns findings whose methodology holds.
 
 ## Security & data handling
 

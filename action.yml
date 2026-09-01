@@ -1,5 +1,5 @@
 name: "Verificate Gate"
-description: "AI-powered CI gate that blocks AI hallucinations in pull requests and runs ISO 5055 quality checks."
+description: "Merge gate for AI-written code: catches invented APIs, mocks-as-done and reward-gamed tests in PRs. ISO 5055 checks. Free, no signup."
 branding: { icon: "shield", color: "green" }
 inputs:
   verificate-api-key:
@@ -11,19 +11,33 @@ inputs:
     required: false
     default: "reject"
   max-files:
-    description: "Max changed code files to review per PR."
+    description: "Max changed code files to review per PR (1-300)."
     required: false
     default: "25"
   mcp-url:
     description: "Verificate MCP endpoint."
     required: false
     default: "https://mcp.verificate.ai/mcp"
+outputs:
+  verdict:
+    description: "Overall gate verdict: 'approved', 'rejected', 'vetoed', or 'error' (gate failures never block merges)."
+    value: ${{ steps.gate.outputs.verdict }}
+  files_reviewed:
+    description: "Number of changed code files reviewed in this pull request."
+    value: ${{ steps.gate.outputs.files_reviewed }}
+  files_errored:
+    description: "Files skipped due to transient gate errors or quota."
+    value: ${{ steps.gate.outputs.files_errored }}
+  files_dropped:
+    description: "Files left unreviewed because the PR exceeded max-files."
+    value: ${{ steps.gate.outputs.files_dropped }}
 runs:
   using: "composite"
   steps:
     - uses: actions/setup-python@v5
       with: { python-version: "3.11" }
-    - run: python "${{ github.action_path }}/gate.py"
+    - id: gate
+      run: python "${{ github.action_path }}/gate.py"
       shell: bash
       env:
         GITHUB_TOKEN: ${{ github.token }}
