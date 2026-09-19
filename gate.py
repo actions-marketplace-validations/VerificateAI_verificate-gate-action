@@ -168,11 +168,29 @@ def mcp_validate(code, lang, rebuttal=""):
     if text.startswith("{"):
         try:
             obj, _ = json.JSONDecoder().raw_decode(text)  # first JSON object; ignore trailing trial note
-            return obj
+            return _not_a_verdict(obj) or obj
         except json.JSONDecodeError:
             pass
     # Not a verdict (e.g. free-tier upsell / trial note) — the gate could not score this.
     return {"_unavailable": True, "text": text[:200]}
+
+def _not_a_verdict(obj):
+    """The gate answers quota/key refusals and "could not review" as JSON with valid:false. Those say
+    NOTHING about the code, so they must not be read as a rejection: until v1.2.1 an exhausted free
+    tier, an expired/invalid key, or a gate-side review timeout marked every file "REJECTED" and
+    blocked the merge — the opposite of what the README promises. Returns an _unavailable marker
+    (with the reason, so the PR comment can say what to do), or None for a real verdict."""
+    if not isinstance(obj, dict):
+        return None
+    if obj.get("validation_type") == "quota" or obj.get("provider") == "quota-gate":
+        reason = str((obj.get("quota") or {}).get("reason") or "free_limit")
+        msg = (obj.get("suggestions") or obj.get("issues") or [""])[0]
+        return {"_unavailable": True, "kind": "access", "reason": reason, "text": str(msg)[:300]}
+    if obj.get("review_unavailable"):
+        return {"_unavailable": True, "kind": "review", "reason": "review_unavailable",
+                "text": "The gate's model review did not complete for this file (timeout or transient error)."}
+    return None
+
 
 def upsert_comment(pr, body):
     try:
@@ -230,8 +248,18 @@ def main():
             print(f"::warning::Verificate gate error on {f['filename']}: {type(e).__name__}: {str(e)[:160]}")
             rows.append((f["filename"], "⚠️ gate error (skipped)", "")); continue
         if res.get("_unavailable"):
-            errors += 1; capped = True
-            print(f"::warning::Verificate gate unavailable for {f['filename']} — shared free-tier limit reached on this runner. "
+            errors += 1
+            reason = res.get("reason", "")
+            if res.get("kind") == "review":
+                print(f"::warning::Verificate could not review {f['filename']} (gate-side timeout/transient error) — "
+                      f"not blocking. Re-run the check; very large files review more reliably when split.")
+                rows.append((f["filename"], "⚠️ skipped — review did not complete", "")); continue
+            if reason in ("invalid_key", "no_active_subscription"):
+                print(f"::warning::Verificate gate refused the VERIFICATE_API_KEY for {f['filename']} ({reason}) — not blocking. "
+                      f"Check the secret's value, or get a fresh free key: https://verificate.ai/auth/signup")
+                rows.append((f["filename"], "⚠️ skipped — API key not accepted", reason)); continue
+            capped = True
+            print(f"::warning::Verificate gate unavailable for {f['filename']} — free-tier limit reached. "
                   f"Add a VERIFICATE_API_KEY secret (free, no card: https://verificate.ai/auth/signup) to get your own quota.")
             rows.append((f["filename"], "⚠️ skipped — free limit reached", "")); continue
         prot = res.get("protection", {})
