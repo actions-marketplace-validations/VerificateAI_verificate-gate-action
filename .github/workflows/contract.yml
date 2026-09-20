@@ -1,0 +1,12 @@
+name: contract
+on: { pull_request: {}, push: { branches: [main] } }
+permissions: { contents: read }
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Verdict classification contract (a gate that could not review never blocks a merge)
+        run: python test_gate.py

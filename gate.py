@@ -9,7 +9,7 @@ Env: GITHUB_TOKEN, GITHUB_REPOSITORY, GITHUB_EVENT_PATH, optional VERIFICATE_MCP
 VERIFICATE_API_KEY, FAIL_ON (reject|off), MAX_FILES.
 """
 from __future__ import annotations
-import base64, html, json, os, ssl, sys, urllib.request, urllib.error
+import base64, html, json, os, random, ssl, sys, time, urllib.parse, urllib.request, urllib.error
 
 COMMENT_MAX = 60000  # keep under GitHub's 65536-char comment limit
 
@@ -37,7 +37,12 @@ OIDC_REQ_TOKEN = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
 MCP_URL = os.environ.get("VERIFICATE_MCP_URL", "https://mcp.verificate.ai/mcp")
 VKEY = os.environ.get("VERIFICATE_API_KEY", "").strip()
 FAIL_ON = os.environ.get("FAIL_ON", "reject").strip().lower()
-MAX_FILES = int(os.environ.get("MAX_FILES", "25"))
+try:
+    MAX_FILES = int(os.environ.get("MAX_FILES", "25"))
+except ValueError:
+    print(f"::warning::max-files '{os.environ.get('MAX_FILES')}' is not an integer; using 25.")
+    MAX_FILES = 25
+MAX_FILES = max(1, min(MAX_FILES, 300))
 MARK = "<!-- verificate-gate -->"
 CODE_EXT = {".py",".js",".ts",".tsx",".jsx",".go",".java",".rb",".rs",".c",".cc",".cpp",
             ".cs",".php",".sql",".sh",".kt",".swift",".scala"}
@@ -62,14 +67,66 @@ def github_oidc_token():
 
 _OIDC = github_oidc_token()
 
+def _open(req, timeout, tries=3, label="request"):
+    """Transient-fault retry: 5xx / network blips get backoff; 4xx raises at once, except
+    secondary rate limits (403/429 with Retry-After), which wait the header's duration."""
+    last = None
+    for attempt in range(1, tries + 1):
+        try:
+            return _urlopen(req, timeout)
+        except urllib.error.HTTPError as e:
+            last = e
+            retry_after = e.headers.get("Retry-After") if e.headers else None
+            if e.code in (403, 429) and retry_after and attempt < tries:
+                wait = min(float(retry_after), 60) + random.uniform(0, 1)
+                print(f"::warning::{label} rate-limited; waiting {wait:.1f}s per Retry-After")
+                time.sleep(wait)
+                continue
+            if e.code in (401, 403, 404, 422, 429) or attempt == tries:
+                raise
+        except (urllib.error.URLError, TimeoutError, ssl.SSLError, ConnectionError, OSError) as e:
+            last = e
+            if attempt == tries:
+                raise
+        wait = (2 ** attempt) + random.uniform(0, 1)
+        print(f"::warning::{label} failed (attempt {attempt}/{tries}); retrying in {wait:.1f}s")
+        time.sleep(wait)
+    raise last
+
+def _urlopen(req, timeout):
+    return urllib.request.urlopen(req, context=_ctx, timeout=timeout)
+
 def gh(path, method="GET", data=None):
     req = urllib.request.Request("https://api.github.com" + path, method=method,
         headers={"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json",
                  "User-Agent": "verificate-gate"})
     if data is not None:
         req.data = json.dumps(data).encode()
-    with urllib.request.urlopen(req, timeout=30) as r:
+        req.add_header("Content-Type", "application/json")
+    with _open(req, 30, label=f"github {method} {path[:60]}") as r:
         return json.loads(r.read() or b"{}")
+
+def gh_all(path):
+    """Follow per_page pagination so large PRs are fully enumerated."""
+    out, page = [], 1
+    while True:
+        chunk = gh(("&" if "?" in path else "?").join([path, f"per_page=100&page={page}"]))
+        if not isinstance(chunk, list):
+            return chunk
+        out += chunk
+        if len(chunk) < 100:
+            return out
+        page += 1
+        if page > 30:
+            return out
+
+def set_output(**kv):
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        for k, v in kv.items():
+            f.write(f"{k}={str(v).replace(chr(10), ' ')}\n")
 
 def mcp_validate(code, lang, rebuttal=""):
     # A rebuttal (from .verificate/rebuttals.md) lets the gate adjudicate a prior finding the
@@ -94,7 +151,7 @@ def mcp_validate(code, lang, rebuttal=""):
         if _OIDC: h["X-Verificate-OIDC"] = _OIDC
         if VKEY: h["Authorization"] = f"Bearer {VKEY}"
         req = urllib.request.Request(MCP_URL, data=body, method="POST", headers=h)
-        raw = urllib.request.urlopen(req, context=_ctx, timeout=120).read().decode()
+        raw = _open(req, 120, tries=2, label=f"mcp {method}").read().decode()
         for line in raw.splitlines():
             line = line.strip()
             if line.startswith("data:"): line = line[5:].strip()
@@ -111,11 +168,29 @@ def mcp_validate(code, lang, rebuttal=""):
     if text.startswith("{"):
         try:
             obj, _ = json.JSONDecoder().raw_decode(text)  # first JSON object; ignore trailing trial note
-            return obj
+            return _not_a_verdict(obj) or obj
         except json.JSONDecodeError:
             pass
     # Not a verdict (e.g. free-tier upsell / trial note) — the gate could not score this.
     return {"_unavailable": True, "text": text[:200]}
+
+def _not_a_verdict(obj):
+    """The gate answers quota/key refusals and "could not review" as JSON with valid:false. Those say
+    NOTHING about the code, so they must not be read as a rejection: until v1.2.1 an exhausted free
+    tier, an expired/invalid key, or a gate-side review timeout marked every file "REJECTED" and
+    blocked the merge — the opposite of what the README promises. Returns an _unavailable marker
+    (with the reason, so the PR comment can say what to do), or None for a real verdict."""
+    if not isinstance(obj, dict):
+        return None
+    if obj.get("validation_type") == "quota" or obj.get("provider") == "quota-gate":
+        reason = str((obj.get("quota") or {}).get("reason") or "free_limit")
+        msg = (obj.get("suggestions") or obj.get("issues") or [""])[0]
+        return {"_unavailable": True, "kind": "access", "reason": reason, "text": str(msg)[:300]}
+    if obj.get("review_unavailable"):
+        return {"_unavailable": True, "kind": "review", "reason": "review_unavailable",
+                "text": "The gate's model review did not complete for this file (timeout or transient error)."}
+    return None
+
 
 def upsert_comment(pr, body):
     try:
@@ -131,11 +206,12 @@ def upsert_comment(pr, body):
 def main():
     ev = json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8"))
     pr = (ev.get("pull_request") or {}).get("number") or ev.get("number")
-    head = (ev.get("pull_request") or {}).get("head", {}).get("sha")
+    head = ((ev.get("pull_request") or {}).get("head") or {}).get("sha") or ""
+    ref_qs = f"?ref={head}" if head else ""
     if not pr:
         print("Not a pull_request event; nothing to gate."); return 0
     try:
-        files = gh(f"/repos/{REPO}/pulls/{pr}/files?per_page=100")
+        files = gh_all(f"/repos/{REPO}/pulls/{pr}/files")
     except Exception as e:
         print(f"::warning::could not list files ({e}); failing open."); return 0
     eligible = [f for f in files if f.get("status") in ("added","modified")
@@ -153,7 +229,7 @@ def main():
     # .verificate/rebuttals.md, feed it to the gate so it can adjudicate and overturn sound rebuttals.
     rebuttal = ""
     try:
-        rb = gh(f"/repos/{REPO}/contents/.verificate/rebuttals.md?ref={head}")
+        rb = gh(f"/repos/{REPO}/contents/.verificate/rebuttals.md{ref_qs}")
         rebuttal = base64.b64decode(rb["content"]).decode("utf-8", "replace")
         if rebuttal.strip():
             print("Verificate: rebuttals.md found — the gate will adjudicate contested findings.")
@@ -164,7 +240,7 @@ def main():
     for f in targets:
         ext = "." + f["filename"].rsplit(".",1)[-1]
         try:
-            meta = gh(f"/repos/{REPO}/contents/{f['filename']}?ref={head}")
+            meta = gh(f"/repos/{REPO}/contents/{urllib.parse.quote(f['filename'])}{ref_qs}")
             code = base64.b64decode(meta["content"]).decode("utf-8","replace")
             res = mcp_validate(code, LANG.get(ext, "text"), rebuttal=rebuttal)
         except Exception as e:
@@ -172,8 +248,18 @@ def main():
             print(f"::warning::Verificate gate error on {f['filename']}: {type(e).__name__}: {str(e)[:160]}")
             rows.append((f["filename"], "⚠️ gate error (skipped)", "")); continue
         if res.get("_unavailable"):
-            errors += 1; capped = True
-            print(f"::warning::Verificate gate unavailable for {f['filename']} — shared free-tier limit reached on this runner. "
+            errors += 1
+            reason = res.get("reason", "")
+            if res.get("kind") == "review":
+                print(f"::warning::Verificate could not review {f['filename']} (gate-side timeout/transient error) — "
+                      f"not blocking. Re-run the check; very large files review more reliably when split.")
+                rows.append((f["filename"], "⚠️ skipped — review did not complete", "")); continue
+            if reason in ("invalid_key", "no_active_subscription"):
+                print(f"::warning::Verificate gate refused the VERIFICATE_API_KEY for {f['filename']} ({reason}) — not blocking. "
+                      f"Check the secret's value, or get a fresh free key: https://verificate.ai/auth/signup")
+                rows.append((f["filename"], "⚠️ skipped — API key not accepted", reason)); continue
+            capped = True
+            print(f"::warning::Verificate gate unavailable for {f['filename']} — free-tier limit reached. "
                   f"Add a VERIFICATE_API_KEY secret (free, no card: https://verificate.ai/auth/signup) to get your own quota.")
             rows.append((f["filename"], "⚠️ skipped — free limit reached", "")); continue
         prot = res.get("protection", {})
@@ -289,6 +375,13 @@ def main():
                   f"{MAX_FILES} and left {dropped} unreviewed.** Raise `max-files` to cover the whole PR."]
     lines += ["", "_Verificate — the merge gate for AI-written code. [Why](https://github.com/VerificateAI/verificate-mcp-quickstart/blob/master/COMPARISON.md)_"]
     upsert_comment(pr, "\n".join(lines))
+
+    set_output(
+        verdict="vetoed" if vetoed_any else ("rejected" if rejected_any else ("error" if errors else "approved")),
+        files_reviewed=len(targets),
+        files_errored=errors,
+        files_dropped=dropped,
+    )
 
     if (vetoed_any or rejected_any) and FAIL_ON == "reject":
         why = "VETOED by a deterministic reality gate" if vetoed_any else "REJECTED"
